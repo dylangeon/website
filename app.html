@@ -44,133 +44,55 @@
   <script src="https://unpkg.com/@teachablemachine/image@0.8.4/dist/teachablemachine-image.min.js"></script>
 
   <!-- App script LAST (depends on the libraries above) -->
-  <script>
-    (function () {
-      var MODEL_URL = './tm-model/';    // folder containing model.json, metadata.json, weights.bin
-      var canvas = document.getElementById('canvas');
-      var ctx = canvas.getContext('2d');
-      var fileInput = document.getElementById('file');
-      var cameraBtn = document.getElementById('cameraBtn');
-      var stopBtn = document.getElementById('stopBtn');
-      var video = document.getElementById('video');
-      var labelEl = document.getElementById('label');
-      var probEl = document.getElementById('prob');
+ <script>
+  const MODEL_URL = './tm-model/';     // folder with model.json / metadata.json / weights.bin
+  const IN_SIZE = 96;                   // model expects 96x96x1
 
-      var model = null;
-      var webcamStream = null;
-      var ready = false;
+  let tmModel, labels = [];
+  let coreModel; // tf.LayersModel under the hood
 
-      function setStatus(labelText, probText) {
-        labelEl.textContent = 'Label: ' + labelText;
-        probEl.textContent = 'Confidence: ' + (probText || '—');
-      }
+  async function loadModel() {
+    document.getElementById('label').textContent = 'Label: (loading model…)';
+    document.getElementById('prob').textContent  = 'Confidence: —';
+    tmModel = await tmImage.load(MODEL_URL + 'model.json', MODEL_URL + 'metadata.json');
+    coreModel = tmModel.model; // raw tf.LayersModel
+    if (tmModel.getClassLabels) labels = await tmModel.getClassLabels();
+    document.getElementById('label').textContent = 'Label: (model ready)';
+  }
 
-      function drawToCanvas(srcEl) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(srcEl, 0, 0, canvas.width, canvas.height);
-      }
+  // Convert the current canvas image -> [1,96,96,1] grayscale tensor
+  function makeInputTensor(fromCanvas) {
+    return tf.tidy(() => {
+      // [H,W,3] 0..255
+      let t = tf.browser.fromPixels(fromCanvas);
+      // Resize to 96x96
+      t = tf.image.resizeBilinear(t, [IN_SIZE, IN_SIZE]);
+      // Convert to grayscale: Y = 0.299 R + 0.587 G + 0.114 B
+      const [r, g, b] = tf.split(t, 3, -1);
+      const y = r.mul(0.299).add(g.mul(0.587)).add(b.mul(0.114)); // [96,96,1]
+      // Normalize 0..1 and add batch dim: [1,96,96,1]
+      return y.div(255).expandDims(0);
+    });
+  }
 
-      function enableInputs() {
-        fileInput.disabled = false;
-        cameraBtn.disabled = false;
-      }
+  async function predictFromCanvas() {
+    if (!coreModel) return;
+    const canvas = document.getElementById('canvas');
+    const input = makeInputTensor(canvas);           // [1,96,96,1]
+    const logits = coreModel.predict(input);         // tf.Tensor
+    const probs = await logits.data();               // Float32Array
+    input.dispose(); logits.dispose();
 
-      function disableInputs() {
-        fileInput.disabled = true;
-        cameraBtn.disabled = true;
-        stopBtn.disabled = true;
-      }
+    // Find top class
+    let topIdx = 0, topVal = -1;
+    for (let i = 0; i < probs.length; i++) {
+      if (probs[i] > topVal) { topVal = probs[i]; topIdx = i; }
+    }
+    const label = labels[topIdx] || `Class ${topIdx}`;
+    document.getElementById('label').textContent = 'Label: ' + label;
+    document.getElementById('prob').textContent  = 'Confidence: ' + (topVal * 100).toFixed(1) + '%';
+  }
+</script>
 
-      async function loadModel() {
-        try {
-          // tmImage is provided by the TM script above
-          model = await tmImage.load(MODEL_URL + 'model.json', MODEL_URL + 'metadata.json');
-          ready = true;
-          setStatus('(model ready)', '—');
-          enableInputs();
-          console.log('Model loaded.');
-        } catch (err) {
-          console.error('Model load failed:', err);
-          setStatus('(model load failed)', err && err.message ? err.message : String(err));
-          disableInputs();
-        }
-      }
-
-      async function predictFromCanvas() {
-        if (!ready || !model) return;
-        try {
-          var preds = await model.predict(canvas);
-          console.log('Predictions:', preds);
-          if (!preds || !preds.length) {
-            setStatus('(no predictions)', '—');
-            return;
-          }
-          preds.sort(function(a, b) { return b.probability - a.probability; });
-          var top = preds[0];
-          setStatus(top.className, (top.probability * 100).toFixed(1) + '%');
-        } catch (err) {
-          console.error('Predict error:', err);
-          setStatus('(predict error)', err && err.message ? err.message : String(err));
-        }
-      }
-
-      // File upload
-      fileInput.addEventListener('change', function (e) {
-        var file = e.target.files && e.target.files[0];
-        if (!file) return;
-        if (!ready) { setStatus('(model not ready)','—'); return; }
-        setStatus('(processing…)','—');
-
-        var img = new Image();
-        img.onload = function () {
-          drawToCanvas(img);
-          predictFromCanvas();
-          try { URL.revokeObjectURL(img.src); } catch (e) {}
-        };
-        img.onerror = function (err) {
-          console.error('Image load error:', err);
-          setStatus('(image load error)','—');
-        };
-        img.src = URL.createObjectURL(file);
-      });
-
-      // Camera on
-      cameraBtn.addEventListener('click', async function () {
-        if (!ready) return;
-        try {
-          webcamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-          video.srcObject = webcamStream;
-          video.style.display = 'block';
-          await video.play();
-
-          function tick() {
-            if (!webcamStream) return;
-            drawToCanvas(video);
-            predictFromCanvas();
-            requestAnimationFrame(tick);
-          }
-          tick();
-          stopBtn.disabled = false;
-        } catch (err) {
-          console.error('Camera error:', err);
-          alert('Camera error: ' + err.message);
-        }
-      });
-
-      // Camera off
-      stopBtn.addEventListener('click', function () {
-        if (webcamStream) {
-          webcamStream.getTracks().forEach(function (t) { t.stop(); });
-          webcamStream = null;
-          video.style.display = 'none';
-          stopBtn.disabled = true;
-        }
-      });
-
-      // Start
-      disableInputs(); // until model loads
-      loadModel();
-    })();
-  </script>
 </body>
 </html>
