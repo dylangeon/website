@@ -22,7 +22,7 @@
       <h1 style="margin:0;">Image Classifier</h1>
     </header>
 
-    <p>Select a photo or use your camera. The model predicts **Fruit** vs **Vegetable**.</p>
+    <p>Select a photo or use your camera. The model predicts <strong>Fruit</strong> vs <strong>Vegetable</strong>.</p>
 
     <div class="row">
       <input id="file" type="file" accept="image/*">
@@ -31,7 +31,10 @@
     </div>
 
     <video id="video" playsinline autoplay muted style="display:none;"></video>
+    <!-- Visible preview canvas (any size is fine) -->
     <canvas id="canvas" width="320" height="320" aria-label="preview"></canvas>
+    <!-- Hidden 96x96 canvas that feeds the model -->
+    <canvas id="prep" width="96" height="96" style="display:none"></canvas>
 
     <div class="status" id="label">Label: (loading model…)</div>
     <div class="status" id="prob">Confidence: —</div>
@@ -47,8 +50,14 @@
   <script>
     (function () {
       var MODEL_URL = './tm-model/';    // folder containing model.json, metadata.json, weights.bin
+
       var canvas = document.getElementById('canvas');
-      var ctx = canvas.getContext('2d');
+      var ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      // Offscreen (hidden) 96x96 canvas that matches model input size
+      var prep = document.getElementById('prep');
+      var pctx = prep.getContext('2d', { willReadFrequently: true });
+
       var fileInput = document.getElementById('file');
       var cameraBtn = document.getElementById('cameraBtn');
       var stopBtn = document.getElementById('stopBtn');
@@ -56,7 +65,9 @@
       var labelEl = document.getElementById('label');
       var probEl = document.getElementById('prob');
 
-      var model = null;
+      var tmModel = null;       // TeachableMachine wrapper
+      var coreModel = null;     // underlying tf.LayersModel
+      var classLabels = [];
       var webcamStream = null;
       var ready = false;
 
@@ -65,9 +76,15 @@
         probEl.textContent = 'Confidence: ' + (probText || '—');
       }
 
+      // Draw to visible preview AND to the 96x96 prep canvas
       function drawToCanvas(srcEl) {
+        // visible preview (for the user)
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(srcEl, 0, 0, canvas.width, canvas.height);
+
+        // model input (exactly 96x96)
+        pctx.clearRect(0, 0, prep.width, prep.height);
+        pctx.drawImage(srcEl, 0, 0, prep.width, prep.height);
       }
 
       function enableInputs() {
@@ -83,34 +100,55 @@
 
       async function loadModel() {
         try {
-          // tmImage is provided by the TM script above
-          model = await tmImage.load(MODEL_URL + 'model.json', MODEL_URL + 'metadata.json');
+          tmModel = await tmImage.load(MODEL_URL + 'model.json', MODEL_URL + 'metadata.json');
+          coreModel = tmModel.model; // raw tf.LayersModel
+          if (tmModel.getClassLabels) {
+            classLabels = await tmModel.getClassLabels();
+          }
           ready = true;
           setStatus('(model ready)', '—');
           enableInputs();
-          console.log('Model loaded.');
+          console.log('Model loaded. Labels:', classLabels);
         } catch (err) {
           console.error('Model load failed:', err);
-          setStatus('(model load failed)', err && err.message ? err.message : String(err));
+          setStatus('(model load failed)', (err && err.message) ? err.message : String(err));
           disableInputs();
         }
       }
 
+      // Convert 96x96 RGB from 'prep' canvas -> grayscale tensor [1,96,96,1], then predict
       async function predictFromCanvas() {
-        if (!ready || !model) return;
+        if (!ready || !coreModel) return;
         try {
-          var preds = await model.predict(canvas);
-          console.log('Predictions:', preds);
-          if (!preds || !preds.length) {
+          var input = tf.tidy(function () {
+            // [96,96,3] 0..255
+            var t = tf.browser.fromPixels(prep);
+            var split = tf.split(t, 3, -1);        // [R,G,B]
+            var r = split[0], g = split[1], b = split[2];
+            // luminance Y = 0.299 R + 0.587 G + 0.114 B  -> [96,96,1]
+            var y = r.mul(0.299).add(g.mul(0.587)).add(b.mul(0.114));
+            return y.div(255).expandDims(0);       // [1,96,96,1]
+          });
+
+          var out = coreModel.predict(input);      // tf.Tensor
+          var probs = await out.data();            // Float32Array
+          input.dispose();
+          out.dispose();
+
+          if (!probs || probs.length === 0) {
             setStatus('(no predictions)', '—');
             return;
           }
-          preds.sort(function(a, b) { return b.probability - a.probability; });
-          var top = preds[0];
-          setStatus(top.className, (top.probability * 100).toFixed(1) + '%');
+
+          var topI = 0, topV = -1;
+          for (var i = 0; i < probs.length; i++) {
+            if (probs[i] > topV) { topV = probs[i]; topI = i; }
+          }
+          var lbl = classLabels[topI] || ('Class ' + topI);
+          setStatus(lbl, (topV * 100).toFixed(1) + '%');
         } catch (err) {
           console.error('Predict error:', err);
-          setStatus('(predict error)', err && err.message ? err.message : String(err));
+          setStatus('(predict error)', (err && err.message) ? err.message : String(err));
         }
       }
 
